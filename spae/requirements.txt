@@ -1,0 +1,4 @@
+# Environment the pipeline was run in (see README): Python 3.10, CUDA 13 build of PyTorch.
+torch==2.11.0
+transformers==5.12.1
+numpy==2.2.6

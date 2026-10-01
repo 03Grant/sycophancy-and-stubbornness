@@ -1,0 +1,30 @@
+{
+  "seed": 0,
+  "split": "test",
+  "excluded_from": [],
+  "n_rows": 1800,
+  "n_scored": 1500,
+  "items": {
+    "nqswap": 150,
+    "memotrap": 0,
+    "truthfulqa": 150
+  },
+  "min_options": 3,
+  "md5": "68af8cf3",
+  "counts": {
+    "F1 | both | wrong_claim_conflict": 150,
+    "F1 | control | baseline": 150,
+    "F1 | hold | correct_claim": 150,
+    "F1 | hold | wrong_claim": 150,
+    "F1 | update | context_conflict": 150,
+    "F1 | update | context_consistent": 150,
+    "F3 | both | wrong_claim_conflict": 150,
+    "F3 | control | closedbook": 150,
+    "F3 | hold | correct_claim": 150,
+    "F3 | hold | wrong_claim": 150,
+    "F3 | update | context_conflict": 150,
+    "F3 | update | context_consistent": 150
+  },
+  "file": "cope_bench_test.jsonl",
+  "md5_full": "68af8cf3e926ac2f0a72deb11d7a8001"
+}
