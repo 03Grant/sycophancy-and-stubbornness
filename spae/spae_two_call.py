@@ -701,6 +701,7 @@ def main() -> None:
     p.add_argument("--directions", help="comma list of row directions to keep")
     p.add_argument("--shard", help="i/n")
     p.add_argument("--limit", type=int)
+    p.add_argument("--rows", type=Path, help="keep only the row ids listed in this file (one per line)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--last-only", action="store_true")
     p.add_argument("--full-letters", action="store_true", help="call2: read the CoT letter over the item's full option set instead of A-D")
@@ -728,6 +729,9 @@ def main() -> None:
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
         records = [r for j, r in enumerate(records) if j % n == i]
+    if args.rows:
+        keep = {x.strip() for x in args.rows.read_text().splitlines() if x.strip()}
+        records = [r for r in records if r["row_id"] in keep]
     records = records[: args.limit] if args.limit else records
     rows1 = {}
     if args.stage == "call2" and args.call1:

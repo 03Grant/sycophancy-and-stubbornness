@@ -29,9 +29,11 @@ The method code was frozen as run; the modules below are the parts of the resear
 | `score.py`, `gates.py` | per-condition table, PFR / UR / Sel, paired bootstrap; eligibility gates from the Original arm's neutral rows |
 | `score_sampled.py` | sampled decoding: the terms per seed, mean and sample standard deviation over the seeds, SPAE minus Original paired by seed |
 | `prompts/call1.txt` | the auxiliary-call wording (with its invented examples), the same for every backbone |
-| `run_qwen35_9b.sh` | the full Qwen3.5-9B pipeline on the test split |
-| `run_qwen35_9b_sampled.sh` | the sampled-decoding repeat of the Qwen3.5-9B comparison (three seeds), after `run_qwen35_9b.sh` |
-| `requirements.txt` | Python dependencies |
+| `run_qwen35_9b.sh` | the Qwen3.5-9B pipeline on the test split: auxiliary call, Original, SPAE, score |
+| `run_qwen35_9b_sampled.sh` | the sampled-decoding repeat of Original and SPAE (three seeds), after `run_qwen35_9b.sh` |
+| `run.py` | one entry point for every arm: `--methods all` or a comma list of arm names, greedy or `--seeds` (see below) |
+| `baselines/` | the six baselines: `run_baseline.py` (S2A, CAD, AdaCAD), `caa.py`, `juice.py` + `juice_core.py`, `autopasta.py` + `autopasta_core.py`, their shared helpers (`common.py`), prompts (`prompts.json`) and the frozen Qwen3.5-9B artifacts (`artifacts/qwen35_9b/`) |
+| `setup.sh`, `requirements.txt` | one-command environment and the pinned dependencies |
 
 ## Environment
 
@@ -42,13 +44,36 @@ is wrapped (the optional fused kernels are not required). `--no-think` switches 
 chat template; every backbone is run as an instruct model with the whole prompt as one user turn.
 
 ```
-pip install -r requirements.txt
+./setup.sh                      # creates .venv with the pinned versions (PyTorch 2.11 for CUDA 13); then: source .venv/bin/activate
+CUDA=cu126 ./setup.sh           # another PyTorch build (cu126, cu128, cu130 or cpu)
 ```
 
-## Reproducing the Qwen3.5-9B rows
+`setup.sh` installs PyTorch from the PyTorch index for the chosen CUDA build and then `requirements.txt` (transformers,
+numpy, and pastalib with its `datasets` import for AutoPASTA). `pip install -r requirements.txt` alone works too and takes
+whichever PyTorch build the package index serves.
+
+## Running the comparison
 
 ```
-MODEL=Qwen/Qwen3.5-9B ./run_qwen35_9b.sh          # or the three stages below by hand
+python run.py --model Qwen/Qwen3.5-9B --methods all                     # Original, the six baselines and SPAE, then score.py
+python run.py --model Qwen/Qwen3.5-9B --methods original,spae,autopasta  # any subset, by arm name
+python run.py --model Qwen/Qwen3.5-9B --methods all --limit 10           # smoke test on ten rows per stage
+python run.py --model Qwen/Qwen3.5-9B --methods all --seeds 0 1 2        # the sampled-decoding repeat of every arm
+```
+
+Arms: `original`, `spae`, `random`, `oracle` (the two-call runner) and `s2a`, `cad`, `adacad`, `caa`, `juice`, `autopasta`
+(the baselines); `all` is the main table. The Original arm is always run first because its neutral rows define the
+eligibility gate; the auxiliary call runs once and is shared by `spae`, `random` and `oracle`. Outputs go to
+`out/<label>/<arm>.jsonl` and `out/<label>/score.md`; with `--seeds`, to `out/<label>/sampled/<arm>_seed<s>.jsonl` and
+`out/<label>/sampled/score.md`. The SPAE parameters, the thinking switch and the sampling values of the five backbones are
+read from the settings table in `run.py` (`--spae-flags` overrides them); the fitted baselines read the artifacts of the
+backbone from `baselines/artifacts/<label>/` (`--artifacts` overrides, `--variant` picks fit-mix, fit-syco or fit-stub).
+Every stage appends to its file and skips rows already on disk, so an interrupted run continues where it stopped.
+
+## Reproducing the Qwen3.5-9B rows by hand
+
+```
+MODEL=Qwen/Qwen3.5-9B ./run_qwen35_9b.sh          # Original and SPAE only; or the three stages below by hand
 ```
 
 ```
@@ -111,6 +136,32 @@ only), `random` (the paper's Random control: the same numbers of tokens drawn un
 the two sets kept disjoint; `--random-window` places each set as one contiguous window instead). `--oracle value
 --oracle-stance` replaces the copied lines by the row's own answer value and stance sentence (the paper's Oracle
 control). The remaining flags are development ablations that the paper setting does not use.
+
+## Baselines
+
+The baseline runners take the same CoPE-Bench rows and write the same record fields as the two-call runner (`reply`,
+`answer`, `aligned`, plus their own diagnostics), so `score.py` scores every arm alike; on chain-of-thought rows `answer`
+is the probe letter read at the fixed suffix and `stated_answer` the letter the reply states in prose. No answer or
+condition label reaches any method; the context-free input of CAD and AdaCAD and the passage of the AutoPASTA extraction
+prompt are derived from the neutral row of the same question.
+
+| arm | runner | what it does |
+|---|---|---|
+| S2A | `run_baseline.py --method s2a` | rewrites the request with the published prompt (`prompts.json`, 1,024-token budget) into an unbiased context and a question, answers from those two parts followed by `Answer in an unbiased way.` and the row's own format instruction; a rewrite without both labelled parts falls back to the original request (`metadata.rewrite_parsed`); `--rewrites` reuses the greedy rewrites of an earlier run |
+| CAD | `run_baseline.py --method cad` | contrastive decoding against the context-free input with the published weight of 1, at every generated token and at the letter probe |
+| AdaCAD | `run_baseline.py --method adacad` | the same with the token-wise Jensen-Shannon divergence (natural log) as the weight (`metadata.max_alpha`) |
+| CAA | `caa.py` | a mean-difference vector per layer from the official 1,000 sycophancy pairs (`--pairs`, sycophancy minus truthful, raw scale), added at one layer with one multiplier from the final prompt token onwards; `--stage fit` scans layers 14 to 18 and multipliers +-{0.5, 1, 1.5, 2} on the development split, `--stage test` runs the selected pair |
+| JuICE | `juice.py` | scales the o_proj contribution of the selected heads by 1 - s (suppression heads) and 1 + e (enhancement heads) with a capture pass and an inject pass per token; `heads` ranks the profiled heads, `fit` runs one of the 36 (s, e) pairs on the held-out development rows, `select` picks the pair, `test` runs it |
+| AutoPASTA | `autopasta.py` | `extract` asks the model for the key sentence of the request's added paragraphs with the published extraction prompt, `map` maps it with all-MiniLM-L6-v2 to the closest sentence and its token span, the search stages (`coarse`, `rank`, `fine`, `candidates`, `fit`, `select`) pick the heads on the development split with a prefill-only read-out, `test` generates under pastalib's attention edit (alpha 0.01, `scale_position` exclude) on the selected heads |
+
+The search stages of the three fitted baselines need an Original run of the development split (`--gates`), whose
+correctly answered neutral rows define the fitting gate; the objective is the share of fitting rows whose reply names the
+row's target answer (`common.hit`). `baselines/artifacts/qwen35_9b/` holds the frozen outcome of the paper's fits for
+Qwen3.5-9B: the CAA vectors and selection, the JuICE head lists and selected pairs, the AutoPASTA selections with their
+layer ranking and candidate configurations, the mapped spans of every test and development row (`spans_test.jsonl`,
+`spans_dev.jsonl`), so the test stages reproduce the paper's inputs without rerunning the extraction, and the Original run
+of the development split that gated the fits (`dev_original.jsonl`). The per-configuration development outputs the
+selections were read from are not included; `fit` regenerates them.
 
 ### Output records
 

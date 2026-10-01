@@ -1,4 +1,6 @@
-# Environment the pipeline was run in (see README): Python 3.10, CUDA 13 build of PyTorch.
+# Environment the pipeline was run in (see README): Python 3.10, CUDA 13 build of PyTorch (setup.sh installs it first).
 torch==2.11.0
 transformers==5.12.1
 numpy==2.2.6
+pastalib==0.1.3
+datasets

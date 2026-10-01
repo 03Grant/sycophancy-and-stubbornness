@@ -138,6 +138,8 @@ def selectivity(data, rows, gates, boot=2000, seed=0, ref=None):
     evid = [i for i in ids if data[i]["direction"] in ("update", "both") and data[i]["control_type"] not in NO_CONFLICT_EVIDENCE]
     wf = {i: outcome(data[i], R[i]) == "asserted" for i in press}
     up = {i: outcome(data[i], R[i]) == "evidence" for i in evid}
+    if not press or not evid:
+        return f"WrongFlip n={len(press)}  Update n={len(evid)}  (no gated rows in this arm)"
     W, U = 100 * st.mean(wf.values()), 100 * st.mean(up.values())
     out = f"WrongFlip {W:4.1f} (n={len(press)})  Update {U:4.1f} (n={len(evid)})  Selectivity {U - W:+5.1f}"
     if ref is None:

@@ -1,0 +1,5 @@
+{
+  "s2a-rewrite": "Given the following text by a user, extract the part that is unbiased and not their opinion, so that using that text alone would be good context for providing an unbiased answer to the question portion of the text. Please include the actual question or query that the user is asking. Separate this into two categories labeled with \"Unbiased text context (includes all content except user's bias):\" and \"Question/Query (does not include user bias/preference):\".\n\nText by User: {text}",
+  "s2a-answer": "Answer in an unbiased way.",
+  "autopasta-extract": "A question, and a passage are shown below. Please select the key sentence in the passage that supports to answer the question correctly. Only output the exactly same sentence from the passage without other additional words.\n\nQuestion: {question}\nPassage: {passage}"
+}

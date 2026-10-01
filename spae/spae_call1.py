@@ -28,6 +28,7 @@ def main() -> None:
     p.add_argument("--no-think", action="store_true", help="pass enable_thinking=False to the chat template (thinking-mode models)")
     p.add_argument("--cells")
     p.add_argument("--limit", type=int)
+    p.add_argument("--rows", type=Path, help="keep only the row ids listed in this file (one per line)")
     p.add_argument("--shard", help="i/n: keep every n-th record starting at i, so shards can run on separate GPUs")
     args = p.parse_args()
     instruction = args.prompt_file.read_text().strip()
@@ -35,6 +36,9 @@ def main() -> None:
     if args.cells:
         keep = set(args.cells.split(","))
         records = [r for r in records if r.get("control_type") in keep]
+    if args.rows:
+        keep = {x.strip() for x in args.rows.read_text().splitlines() if x.strip()}
+        records = [r for r in records if r["row_id"] in keep]
     records = records[: args.limit] if args.limit else records
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
@@ -49,11 +53,13 @@ def main() -> None:
         tok.pad_token = tok.eos_token
     if args.no_think:
         K.CHAT_KWARGS = {"enable_thinking": False}
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
     try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
-    model = model.to("cuda").eval()
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    model = model.to(device).eval()
     trailing = K.trailing_turn_tokens(tok)
     t0 = time.time()
     with args.out.open("a") as fh, torch.no_grad():
