@@ -6,9 +6,9 @@
 Arms: original, spae, random, oracle (the two-call runner) and s2a, cad, adacad, caa, juice, autopasta (the baselines).
 `all` is the paper's main table: original, the six baselines and spae. The Original arm is always run first because its
 neutral rows define the eligibility gate; the auxiliary call runs once and is shared by spae / random / oracle. The fitted
-baselines read the frozen artifacts of their backbone from baselines/artifacts/<label>/ (shipped for Qwen3.5-9B). With
+baselines (caa, juice, autopasta) read the artifacts that fit.py wrote for the backbone from out/<label>/artifacts/. With
 --seeds, every requested arm is rerun with the reply sampled at the backbone's shipped values (the sampled-decoding
-appendix) and aggregated over the seeds.
+appendix) and aggregated over the seeds. --device-map auto spreads a backbone over every visible GPU.
 """
 import argparse
 import json
@@ -60,10 +60,11 @@ def main():
     p.add_argument('--data', default=str(HERE.parent / 'CoPE-Bench' / 'cope_bench_test.jsonl'))
     p.add_argument('--out', help='output directory (default out/<label>)')
     p.add_argument('--label', help='backbone label for the output directory and the artifacts (default: from the settings table, else the model name)')
-    p.add_argument('--artifacts', help='fitted-baseline artifacts directory (default baselines/artifacts/<label>)')
+    p.add_argument('--artifacts', help='fitted-baseline artifacts directory, as written by fit.py (default out/<label>/artifacts)')
     p.add_argument('--variant', default='fit-mix', choices=['fit-mix', 'fit-syco', 'fit-stub'], help='which fit of CAA / JuICE / AutoPASTA')
     p.add_argument('--spae-flags', help='override the SPAE parameters (default: the settings table entry of the backbone)')
     p.add_argument('--no-think', action='store_true', help='force the thinking switch off (default: from the settings table)')
+    p.add_argument('--device-map', help='spread the model over several GPUs with accelerate, e.g. auto (default: one device)')
     p.add_argument('--batch', type=int, default=1, help='batch size of the baseline runners')
     p.add_argument('--limit', type=int, help='smoke test: rows per stage')
     p.add_argument('--rows', help='row-id file (one per line): every stage runs on these rows only')
@@ -77,7 +78,7 @@ def main():
     out = Path(a.out or HERE / 'out' / label)
     out.mkdir(parents=True, exist_ok=True)
     log = out / 'run.log'
-    arts = Path(a.artifacts or HERE / 'baselines' / 'artifacts' / label)
+    arts = Path(a.artifacts or out / 'artifacts')
     methods = []
     for m in [x.strip() for x in a.methods.split(',') if x.strip()]:
         for name in (ALL if m == 'all' else [m]):
@@ -92,6 +93,14 @@ def main():
     if spae is None and set(methods) & {'spae', 'random', 'oracle'}:
         sys.exit('no settings entry for this backbone: pass --spae-flags')
     think = ['--no-think'] if a.no_think or cfg.get('think', True) else []
+    dm = ['--device-map', a.device_map] if a.device_map else []
+    needed = {'caa': [arts / 'caa' / 'vectors.pt', arts / 'caa' / 'selection.jsonl'],
+              'juice': [arts / 'juice' / a.variant / 'heads_v2.jsonl', arts / 'juice' / a.variant / 'selection_v2.jsonl'],
+              'autopasta': [arts / 'autopasta' / a.variant / 'selection.jsonl', arts / 'autopasta' / 'spans_test.jsonl']}
+    for m in methods:
+        missing = [str(f) for f in needed.get(m, []) if not f.exists()]
+        if missing:
+            sys.exit(f'{m}: missing {missing}; fit it first: python fit.py --model {a.model} --methods {m}')
     limit = ['--limit', str(a.limit)] if a.limit else []
     rows_arg = ['--rows', str(Path(a.rows).resolve())] if a.rows else []
     py, D = a.python, str(a.data)
@@ -117,7 +126,7 @@ def main():
     need = {'all': min(n_all, a.limit) if a.limit else n_all, 'scored': min(n_scored, a.limit) if a.limit else n_scored}
     call1 = out / 'call1.jsonl'
     if set(methods) & TWO_CALL and not complete(call1, need['all']):
-        run([py, 'spae_call1.py', '--model', a.model, '--conditions', D, '--prompt-file', 'prompts/call1.txt', *think, *limit, *rows_arg, '--out', str(call1)], log)
+        run([py, 'spae_call1.py', '--model', a.model, '--conditions', D, '--prompt-file', 'prompts/call1.txt', *think, *dm, *limit, *rows_arg, '--out', str(call1)], log)
     for seed in seeds:
         for m in methods:
             target = path(m, seed)
@@ -132,23 +141,23 @@ def main():
                 # the greedy Original runs on every row (its neutral rows define the gate); a sampled Original on the scored rows only
                 cells = [] if m == 'original' and seed is None else ['--cells', SCORED]
                 run([py, 'spae_two_call.py', 'call2', '--model', a.model, '--conditions', D, '--call1', str(call1), '--prompt-file', 'prompts/call1.txt',
-                     *arm, *cells, *SPAE_COMMON.split(), *spae.split(), *think, *limit, *rows_arg, *sf, '--out', str(target)], log)
+                     *arm, *cells, *SPAE_COMMON.split(), *spae.split(), *think, *dm, *limit, *rows_arg, *sf, '--out', str(target)], log)
             elif m in ('s2a', 'cad', 'adacad'):
                 extra = ['--rewrites', str(path('s2a', None))] if m == 's2a' and seed is not None and path('s2a', None).exists() else []
                 run([py, 'baselines/run_baseline.py', '--model', a.model, '--model-label', label, '--data', D, '--method', m, '--batch', str(a.batch),
-                     *think, *limit, *rows_arg, *sf, *extra, '--out', str(target)], log)
+                     *think, *dm, *limit, *rows_arg, *sf, *extra, '--out', str(target)], log)
             elif m == 'caa':
                 run([py, 'baselines/caa.py', '--model', a.model, '--model-label', label, '--data', D, '--stage', 'test', '--vectors', str(arts / 'caa' / 'vectors.pt'),
-                     '--selection', str(arts / 'caa' / 'selection.jsonl'), '--variant', a.variant, '--batch', str(a.batch), *think, *sf, '--out', str(target)]
+                     '--selection', str(arts / 'caa' / 'selection.jsonl'), '--variant', a.variant, '--batch', str(a.batch), *think, *dm, *sf, '--out', str(target)]
                     + (['--rows', str(limit_rows(rows, a.limit, out))] if a.limit else rows_arg), log)
             elif m == 'juice':
                 run([py, 'baselines/juice.py', '--stage', 'test', '--model', a.model, '--model-label', label, '--data', D, '--variant', a.variant,
-                     '--artifacts', str(arts / 'juice' / a.variant), '--batch', str(a.batch), *think, *sf, '--out', str(target)]
+                     '--artifacts', str(arts / 'juice' / a.variant), '--batch', str(a.batch), *think, *dm, *sf, '--out', str(target)]
                     + (['--rows', str(limit_rows(rows, a.limit, out))] if a.limit else rows_arg), log)
             elif m == 'autopasta':
                 run([py, 'baselines/autopasta.py', '--stage', 'test', '--model', a.model, '--model-label', label, '--data', D, '--variant', a.variant,
                      '--artifacts', str(arts / 'autopasta' / a.variant), '--spans', str(arts / 'autopasta' / 'spans_test.jsonl'), '--batch', str(a.batch),
-                     *think, *sf, '--out', str(target)] + (['--rows', str(limit_rows(rows, a.limit, out))] if a.limit else rows_arg), log)
+                     *think, *dm, *sf, '--out', str(target)] + (['--rows', str(limit_rows(rows, a.limit, out))] if a.limit else rows_arg), log)
     if a.skip_score:
         return
     names = {'original': 'Original', 'spae': 'SPAE', 'random': 'Random', 'oracle': 'Oracle', 's2a': 'S2A', 'cad': 'CAD', 'adacad': 'AdaCAD',

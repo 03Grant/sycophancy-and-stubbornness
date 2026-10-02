@@ -1,6 +1,6 @@
 """CAA: a per-layer mean-difference vector from the official 1,000 sycophancy pairs, added to the residual stream at one
 layer with one multiplier; the (layer, multiplier) pair is selected on the development split (`--stage fit`, every
-layer by default as in the CAA protocol, `--layers` narrows the scan) and then held fixed (`--stage test`)."""
+layer by default, `--layers middle` for the five middle layers, or a range / list) and then held fixed (`--stage test`)."""
 import argparse
 import hashlib
 import json
@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 
+PAIRS_URL = 'https://raw.githubusercontent.com/nrimsky/CAA/main/datasets/generate/sycophancy/generate_dataset.json'
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from common import add_model_args, add_sampling_args, decoder_layers, hit, keep_rows, load, model_text_config   # noqa: E402
@@ -39,7 +40,12 @@ def vectors(engine, pairs_path, out, batch):
             raise ValueError('CAA pair checksum changed')
         return old['vectors']
     if pairs_path is None:
-        raise ValueError(f'{out} does not exist and no --pairs file was given to build it')
+        pairs_path = out.parent / 'official_caa_sycophancy_1000.json'
+        if not pairs_path.exists():
+            import urllib.request
+            print(f'downloading the official CAA sycophancy pairs to {pairs_path}', flush=True)
+            pairs_path.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(PAIRS_URL, pairs_path)
     pairs = json.loads(pairs_path.read_text())
     assert len(pairs) == 1000
     fingerprint = hashlib.sha256(pairs_path.read_bytes()).hexdigest()
@@ -48,7 +54,7 @@ def vectors(engine, pairs_path, out, batch):
     for li, block in enumerate(decoder_layers(engine.model)):
         def capture(_module, _inputs, output, li=li):
             h = output[0] if isinstance(output, tuple) else output
-            values = h[torch.arange(h.shape[0], device=h.device), state['positions']]
+            values = h[torch.arange(h.shape[0], device=h.device), state['positions'].to(h.device)]
             sums[li].add_(state['sign'] * values.detach().double().sum(0).cpu())
         handles.append(block.register_forward_hook(capture))
     try:
@@ -76,7 +82,10 @@ def vectors(engine, pairs_path, out, batch):
 
 
 def scan_layers(spec, n_layers):
-    """The layer indices a fit scans: every layer for 'all', else an inclusive range 'a-b' or a comma-separated list."""
+    """The layer indices a fit scans: every layer for 'all', the five middle layers for 'middle', else an inclusive range 'a-b' or a comma-separated list."""
+    if spec == 'middle':
+        center = n_layers // 2
+        return list(range(center - 2, center + 3))
     if spec == 'all':
         return list(range(n_layers))
     if '-' in spec:
@@ -99,7 +108,7 @@ def steer(engine, vector, layer, multiplier, prompt_width):
         # prefill: apply from the final prompt token onwards; cached generation: each new token
         start = prompt_width - 1 if hidden.shape[1] >= prompt_width else 0
         changed = hidden.clone()
-        changed[:, start:, :] += value
+        changed[:, start:, :] += value.to(hidden.device)
         return (changed,) + output[1:] if isinstance(output, tuple) else changed
     handle = decoder_layers(engine.model)[layer].register_forward_hook(hook)
     try:
@@ -147,22 +156,23 @@ def main():
     p.add_argument('--data', type=Path, required=True)
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--stage', choices=['fit', 'test'], required=True)
-    p.add_argument('--pairs', type=Path, help='the official 1,000 sycophancy pairs (needed to build the vectors; checked against an existing vectors file)')
+    p.add_argument('--pairs', type=Path, help='the official 1,000 sycophancy pairs (default: downloaded next to --vectors when the vectors have to be built; checked against an existing vectors file)')
     p.add_argument('--vectors', type=Path, required=True)
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--gates', nargs='+', help='fit: Original run of the development split (its neutral rows define the fitting gate)')
     p.add_argument('--selection', type=Path, help='test: the selection file written by --stage fit')
     p.add_argument('--variant', choices=['fit-mix', 'fit-syco', 'fit-stub'], default='fit-mix')
-    p.add_argument('--layers', default='all', help="fit: layers to scan: 'all' (default), a range 'a-b' (inclusive) or a comma list")
+    p.add_argument('--layers', default='all', help="fit: layers to scan: 'all' (every layer, default), 'middle' (the five middle layers), a range 'a-b' (inclusive) or a comma list")
+    p.add_argument('--multipliers', default='-2,-1.5,-1,-0.5,0.5,1,1.5,2', help='fit: comma list of multipliers')
     p.add_argument('--shard', default='0/1')
     add_sampling_args(p)
     a = p.parse_args()
     label = a.model_label or Path(a.model).name
-    data = load([a.data])
-    rows = keep_rows([r for r in data.values() if r['direction'] != 'control'], a.rows)
+    data = {r['row_id']: r for r in keep_rows(list(load([a.data]).values()), a.rows)}
+    rows = [r for r in data.values() if r['direction'] != 'control']
     if a.stage == 'fit' and any(r['split'] != 'dev' for r in data.values()):
         raise ValueError('Fit requires the development split only')
-    engine = Engine(a.model, a.cap_gib, a.no_think)
+    engine = Engine(a.model, a.cap_gib, a.no_think, a.device_map)
     engine.configure_sampling(a)
     engine.batch = a.batch
     vecs = vectors(engine, a.pairs, a.vectors, a.batch)
@@ -179,11 +189,12 @@ def main():
         raise ValueError('Incomplete development gates')
     eligible = {r['item_id'] for r in controls if hit(r, original[r['row_id']], 'gold')}
     layers = scan_layers(a.layers, len(vecs))
-    multipliers = [-2, -1.5, -1, -.5, .5, 1, 1.5, 2]
+    multipliers = [float(x) for x in a.multipliers.split(',')]
     all_scores = []
     for layer in layers:
         for multiplier in multipliers:
             path = a.out.parent / 'scan' / f'layer{layer}_mult{multiplier:g}.jsonl'
+            print(json.dumps({'stage': 'caa_scan', 'layer': layer, 'multiplier': multiplier}), flush=True)
             predictions = evaluate(engine, rows, vecs[layer], layer, multiplier, path, a.batch, label, probe=False)
             scores = {}
             for variant, cell in [('fit-mix', None), ('fit-syco', 'wrong_claim'), ('fit-stub', 'context_conflict')]:

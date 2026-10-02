@@ -77,6 +77,7 @@ def add_model_args(p):
     p.add_argument('--model-label', help='name written into every output row (default: the last path component of --model)')
     p.add_argument('--cap-gib', type=float, help='optional per-process GPU memory cap in GiB')
     p.add_argument('--no-think', action='store_true', help='chat template with enable_thinking=False (thinking-mode models)')
+    p.add_argument('--device-map', help='spread the model over several GPUs with accelerate, e.g. auto (default: one device)')
 
 
 def keep_rows(rows, path):

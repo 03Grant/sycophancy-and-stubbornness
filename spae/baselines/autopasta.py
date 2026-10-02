@@ -2,8 +2,8 @@
 coarse-to-fine head search on the development split (`coarse`, `rank`, `fine`, `candidates`, `fit`, `select`) with a
 prefill-only read-out, and the test run under the selected heads (`test`).
 
-The search stages and the test stage read the spans from a mapping file (`--spans`); the shipped artifacts hold the
-mappings of the paper's run so that the test stage reproduces its inputs, and `extract` + `map` rebuild them."""
+The search stages and the test stage read the spans from a mapping file (`--spans`, the output of `extract` + `map` on
+the same split); `fit.py` runs every stage in order for one backbone."""
 import argparse
 import hashlib
 import json
@@ -61,10 +61,11 @@ def main():
     p.add_argument('--extracted', type=Path, help='map: the output of --stage extract')
     p.add_argument('--artifacts', type=Path, help='directory with rank.jsonl, candidates.jsonl, selection.jsonl and the coarse/, fine/, fit/ outputs')
     p.add_argument('--out', type=Path, required=True)
-    p.add_argument('--layer-start', type=int)
-    p.add_argument('--layer-end', type=int)
-    p.add_argument('--rank-index', type=int)
-    p.add_argument('--config-index', type=int)
+    p.add_argument('--layer-start', type=int, default=0, help='coarse: first layer (default 0)')
+    p.add_argument('--layer-end', type=int, help='coarse: one past the last layer (default: the layer count)')
+    p.add_argument('--rank-index', type=int, help='fine: one of the six ranked layers, written to --out (default: all six, written to --out/rank_N.jsonl)')
+    p.add_argument('--config-index', type=int, help='fit: one of the 28 candidates, written to --out (default: every candidate, written to --out/config_XX.jsonl)')
+    p.add_argument('--configs', help='fit: comma list of candidate indices instead of all 28')
     p.add_argument('--shard', default='0/1')
     p.add_argument('--limit', type=int)
     p.add_argument('--batch', type=int, default=1)
@@ -78,7 +79,7 @@ def main():
         a.out.write_text(json.dumps(r) + '\n')
         print('COMPLETE', flush=True)
 
-    data = load([a.data])
+    data = {r['row_id']: r for r in keep_rows(list(load([a.data]).values()), a.rows)}
     rows = [r for r in data.values() if r['direction'] != 'control']
     bare_map = {r['item_id']: r['prompt'] for r in data.values() if r['direction'] == 'control'}
     if a.stage in ('extract', 'map', 'test'):
@@ -90,7 +91,7 @@ def main():
         rows = rows[:a.limit]
     if a.stage == 'map':
         from autopasta_core import PastaEngine
-        e = PastaEngine(a.model, a.cap_gib, a.no_think)
+        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
         extracted = load([a.extracted])
         done = load([a.out]) if a.out.exists() else {}
         with a.out.open('a', buffering=1) as fh:
@@ -104,7 +105,7 @@ def main():
         return
     if a.stage == 'extract':
         from autopasta_core import PastaEngine
-        e = PastaEngine(a.model, a.cap_gib, a.no_think)
+        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
         e.batch = a.batch
         done = load([a.out]) if a.out.exists() else {}
         todo = [r for r in rows if r['row_id'] not in done]
@@ -159,16 +160,15 @@ def main():
             deps[filename] = hashlib.sha256((art / filename).read_bytes()).hexdigest()
     used = {'fine': ['rank.jsonl'], 'fit': ['candidates.jsonl'], 'test': ['selection.jsonl']}.get(a.stage, [])
     deps = {k: v for k, v in deps.items() if k in ['data', 'mappings'] + used}
-    sig = {'args': {k: str(v) for k, v in vars(a).items() if k != 'batch'}, 'deps': deps, 'metric': METRIC,
+    sig = {'args': {k: str(v) for k, v in vars(a).items() if k not in ('batch', 'rank_index', 'config_index', 'configs')}, 'deps': deps, 'metric': METRIC,
            'code': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
            'core': hashlib.sha256((HERE / 'autopasta_core.py').read_bytes()).hexdigest()}
     cfg = a.out.with_suffix('.config.json')
     if cfg.exists():
         assert json.loads(cfg.read_text()) == sig, 'Incompatible resume'
     cfg.write_text(json.dumps(sig, indent=2) + '\n')
-    done = load([a.out]) if a.out.exists() else {}
     from autopasta_core import PastaEngine
-    e = PastaEngine(a.model, a.cap_gib, a.no_think)
+    e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
     e.configure_sampling(a)
     e.batch = a.batch
     prepared = [(r, e.encode(r['prompt']), maps[r['row_id']]['highlight_tokens']) for r in rows]
@@ -194,28 +194,41 @@ def main():
             correct.append(int((allowed[int(logits[0, allowed].argmax())] if allowed else int(logits[0].argmax())) == target))
         return {'probability': sum(probs) / len(probs), 'target_rate': sum(correct) / len(correct), 'rows': len(probs), 'metric': METRIC}
 
-    with a.out.open('a', buffering=1) as fh:
-        def save(r):
-            fh.write(json.dumps(r, ensure_ascii=False) + '\n')
-            fh.flush()
-            os.fsync(fh.fileno())
-            print(r.get('row_id'), flush=True)
-        if a.stage == 'coarse':
-            assert 0 <= a.layer_start < a.layer_end <= nl
-            for l in range(a.layer_start, a.layer_end):
-                if l in full and str(l) not in done:
-                    save({'row_id': str(l), 'layer': l, **evaluate({l: list(range(nh))})})
-        elif a.stage == 'fine':
-            l = json.loads((art / 'rank.jsonl').read_text())['layers'][a.rank_index]
-            for h in range(nh):
-                if f'{l}:{h}' not in done:
-                    save({'row_id': f'{l}:{h}', 'layer': l, 'head': h, **evaluate({l: [h]})})
-        elif a.stage == 'fit':
-            conf = json.loads((art / 'candidates.jsonl').read_text())['configs'][a.config_index]
-            if str(a.config_index) not in done:
-                save({'row_id': str(a.config_index), 'config_index': a.config_index, **evaluate(conf['heads'])})
-        else:
-            heads = json.loads((art / 'selection.jsonl').read_text())['selected']['heads']
+    def run_into(path, jobs):
+        """Evaluate the (row_id, record function) jobs not yet in `path`, appending each record (resumable)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        done = load([path]) if path.exists() else {}
+        with path.open('a', buffering=1) as fh:
+            for rid, fn in jobs:
+                if rid in done:
+                    continue
+                r = fn()
+                fh.write(json.dumps(r, ensure_ascii=False) + '\n')
+                fh.flush()
+                os.fsync(fh.fileno())
+                print(json.dumps({'stage': a.stage, 'file': str(path), 'row_id': rid}), flush=True)
+
+    if a.stage == 'coarse':
+        if a.layer_end is None:
+            a.layer_end = nl
+        assert 0 <= a.layer_start < a.layer_end <= nl
+        run_into(a.out, [(str(l), lambda l=l: {'row_id': str(l), 'layer': l, **evaluate({l: list(range(nh))})}) for l in range(a.layer_start, a.layer_end) if l in full])
+    elif a.stage == 'fine':
+        ranked_layers = json.loads((art / 'rank.jsonl').read_text())['layers']
+        for ri in ([a.rank_index] if a.rank_index is not None else range(len(ranked_layers))):
+            l = ranked_layers[ri]
+            run_into(a.out if a.rank_index is not None else a.out / f'rank_{ri}.jsonl',
+                     [(f'{l}:{h}', lambda l=l, h=h: {'row_id': f'{l}:{h}', 'layer': l, 'head': h, **evaluate({l: [h]})}) for h in range(nh)])
+    elif a.stage == 'fit':
+        configs = json.loads((art / 'candidates.jsonl').read_text())['configs']
+        indices = [a.config_index] if a.config_index is not None else [int(x) for x in a.configs.split(',')] if a.configs else list(range(len(configs)))
+        for ci in indices:
+            run_into(a.out if a.config_index is not None else a.out / f'config_{ci:02d}.jsonl',
+                     [(str(ci), lambda ci=ci: {'row_id': str(ci), 'config_index': ci, **evaluate(configs[ci]['heads'])})])
+    else:
+        heads = json.loads((art / 'selection.jsonl').read_text())['selected']['heads']
+        done = load([a.out]) if a.out.exists() else {}
+        with a.out.open('a', buffering=1) as fh:
             for style in ['short_phrase', 'cot_letter']:
                 group = [x for x in prepared if x[0]['instruction_style'] == style and x[0]['row_id'] not in done]
                 for start in range(0, len(group), a.batch):
@@ -226,7 +239,11 @@ def main():
                         extra = {'model': label, 'method': 'autopasta-' + a.variant, 'selected_head_count': sum(map(len, heads.values()))}
                         out = finish_row(e, r, gen, extra, lambda letters, ids=ids, gen=gen, span=span: e.pasta_probe(ids, gen, letters, span, heads))
                         out['aligned'] = bool(span)
-                        save(out)
+                        fh.write(json.dumps(out, ensure_ascii=False) + '\n')
+                        done[r['row_id']] = out
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    print(json.dumps({'stage': 'test', 'rows': len(done), 'expected': len(prepared)}), flush=True)
     print('COMPLETE', flush=True)
 
 

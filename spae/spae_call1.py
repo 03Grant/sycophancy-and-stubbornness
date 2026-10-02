@@ -28,6 +28,7 @@ def main() -> None:
     p.add_argument("--no-think", action="store_true", help="pass enable_thinking=False to the chat template (thinking-mode models)")
     p.add_argument("--cells")
     p.add_argument("--limit", type=int)
+    p.add_argument("--device-map", help="spread the model over several GPUs with accelerate, e.g. auto (default: one device)")
     p.add_argument("--rows", type=Path, help="keep only the row ids listed in this file (one per line)")
     p.add_argument("--shard", help="i/n: keep every n-th record starting at i, so shards can run on separate GPUs")
     args = p.parse_args()
@@ -55,11 +56,12 @@ def main() -> None:
         K.CHAT_KWARGS = {"enable_thinking": False}
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    extra = {"device_map": args.device_map} if args.device_map else {}
     try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, **extra)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
-    model = model.to(device).eval()
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, **extra)
+    model = (model if args.device_map else model.to(device)).eval()
     trailing = K.trailing_turn_tokens(tok)
     t0 = time.time()
     with args.out.open("a") as fh, torch.no_grad():

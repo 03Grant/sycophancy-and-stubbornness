@@ -32,13 +32,15 @@ The method code was frozen as run; the modules below are the parts of the resear
 | `run_qwen35_9b.sh` | the Qwen3.5-9B pipeline on the test split: auxiliary call, Original, SPAE, score |
 | `run_qwen35_9b_sampled.sh` | the sampled-decoding repeat of Original and SPAE (three seeds), after `run_qwen35_9b.sh` |
 | `run.py` | one entry point for every arm: `--methods all` or a comma list of arm names, greedy or `--seeds` (see below) |
-| `baselines/` | the six baselines: `run_baseline.py` (S2A, CAD, AdaCAD), `caa.py`, `juice.py` + `juice_core.py`, `autopasta.py` + `autopasta_core.py`, their shared helpers (`common.py`), prompts (`prompts.json`) and the frozen Qwen3.5-9B artifacts (`artifacts/qwen35_9b/`) |
+| `fit.py` | the development-split fit of CAA, JuICE and AutoPASTA for one backbone, writing the artifacts that `run.py` reads |
+| `baselines/` | the six baselines: `run_baseline.py` (S2A, CAD, AdaCAD), `caa.py`, `juice.py` + `juice_core.py`, `autopasta.py` + `autopasta_core.py`, their shared helpers (`common.py`) and prompts (`prompts.json`) |
 | `setup.sh`, `requirements.txt` | one-command environment and the pinned dependencies |
 
 ## Environment
 
-Python 3.10, PyTorch 2.11 (CUDA 13), transformers 5.12, numpy 2.2; Qwen3.5-9B in bf16 needs about 20 GB of GPU
-memory; the paper's runs used NVIDIA H200 GPUs. The kernel replaces `eager_attention_forward` of the model's attention module, so the runner loads the
+Python 3.10, PyTorch 2.11 (CUDA 13), transformers 5.12, numpy 2.2, accelerate; Qwen3.5-9B in bf16 needs about 20 GB of GPU
+memory; the paper's runs used NVIDIA H200 GPUs. A backbone that does not fit on one GPU (gemma-4-26B-A4B-it, Qwen3.8-27B on
+32 GB cards) is spread over every visible GPU with `--device-map auto` (accepted by `run.py`, `fit.py` and every runner). The kernel replaces `eager_attention_forward` of the model's attention module, so the runner loads the
 model with `attn_implementation="eager"`; on Qwen3.5 the transformers implementation of the Gated DeltaNet layers
 is wrapped (the optional fused kernels are not required). `--no-think` switches the Qwen3.5 thinking mode off in the
 chat template; every backbone is run as an instruct model with the whole prompt as one user turn.
@@ -49,26 +51,33 @@ CUDA=cu126 ./setup.sh           # another PyTorch build (cu126, cu128, cu130 or 
 ```
 
 `setup.sh` installs PyTorch from the PyTorch index for the chosen CUDA build and then `requirements.txt` (transformers,
-numpy, and pastalib with its `datasets` import for AutoPASTA). `pip install -r requirements.txt` alone works too and takes
-whichever PyTorch build the package index serves.
+numpy, accelerate, and pastalib with its `datasets` import for AutoPASTA). `pip install -r requirements.txt` alone works
+too and takes whichever PyTorch build the package index serves.
 
 ## Running the comparison
 
 ```
+python fit.py --model Qwen/Qwen3.5-9B                                    # fit CAA, JuICE and AutoPASTA on the development split
 python run.py --model Qwen/Qwen3.5-9B --methods all                     # Original, the six baselines and SPAE, then score.py
 python run.py --model Qwen/Qwen3.5-9B --methods original,spae,autopasta  # any subset, by arm name
 python run.py --model Qwen/Qwen3.5-9B --methods all --limit 10           # smoke test on ten rows per stage
 python run.py --model Qwen/Qwen3.5-9B --methods all --seeds 0 1 2        # the sampled-decoding repeat of every arm
+python run.py --model google/gemma-4-26B-A4B-it --methods all --device-map auto   # a backbone spread over several GPUs
 ```
+
+The package ships code only: the fitted baselines (`caa`, `juice`, `autopasta`) need the artifacts that `fit.py` writes
+for the backbone (see Baselines below); `run.py` names the missing file and the `fit.py` command when they are absent.
+The prompt-level and decoding-level arms and SPAE itself need no fit.
 
 Arms: `original`, `spae`, `random`, `oracle` (the two-call runner) and `s2a`, `cad`, `adacad`, `caa`, `juice`, `autopasta`
 (the baselines); `all` is the main table. The Original arm is always run first because its neutral rows define the
 eligibility gate; the auxiliary call runs once and is shared by `spae`, `random` and `oracle`. Outputs go to
 `out/<label>/<arm>.jsonl` and `out/<label>/score.md`; with `--seeds`, to `out/<label>/sampled/<arm>_seed<s>.jsonl` and
 `out/<label>/sampled/score.md`. The SPAE parameters, the thinking switch and the sampling values of the five backbones are
-read from the settings table in `run.py` (`--spae-flags` overrides them); the fitted baselines read the artifacts of the
-backbone from `baselines/artifacts/<label>/` (`--artifacts` overrides, `--variant` picks fit-mix, fit-syco or fit-stub).
-Every stage appends to its file and skips rows already on disk, so an interrupted run continues where it stopped.
+read from the settings table in `run.py` (`--spae-flags` overrides them; a model outside the table needs `--spae-flags`
+and gets `--no-think`); the fitted baselines read the artifacts of the backbone from `out/<label>/artifacts/`
+(`--artifacts` overrides, `--variant` picks fit-mix, fit-syco or fit-stub). Every stage appends to its file and skips rows
+already on disk, so an interrupted run continues where it stopped.
 
 ## Reproducing the Qwen3.5-9B rows by hand
 
@@ -151,17 +160,35 @@ prompt are derived from the neutral row of the same question.
 | CAD | `run_baseline.py --method cad` | contrastive decoding against the context-free input with the published weight of 1, at every generated token and at the letter probe |
 | AdaCAD | `run_baseline.py --method adacad` | the same with the token-wise Jensen-Shannon divergence (natural log) as the weight (`metadata.max_alpha`) |
 | CAA | `caa.py` | a mean-difference vector per layer from the official 1,000 sycophancy pairs (`--pairs`, sycophancy minus truthful, raw scale), added at one layer with one multiplier from the final prompt token onwards; `--stage fit` scans every layer (`--layers` narrows it, e.g. `14-18`) and multipliers +-{0.5, 1, 1.5, 2} on the development split, `--stage test` runs the selected pair |
-| JuICE | `juice.py` | scales the o_proj contribution of the selected heads by 1 - s (suppression heads) and 1 + e (enhancement heads) with a capture pass and an inject pass per token; `profile` scales one head at a time by 1 + alpha over the alpha grid on the four profiling rows and records the change of the target token's probability (prefill only), `heads` ranks the profiled heads by their gain sum over the positive and the negative alphas (up to ten each), `fit` runs one of the 36 (s, e) pairs on the held-out development rows, `select` picks the pair, `test` runs it |
-| AutoPASTA | `autopasta.py` | `extract` asks the model for the key sentence of the request's added paragraphs with the published extraction prompt, `map` maps it with all-MiniLM-L6-v2 to the closest sentence and its token span, the search stages (`coarse`, `rank`, `fine`, `candidates`, `fit`, `select`) pick the heads on the development split with a prefill-only read-out, `test` generates under pastalib's attention edit (alpha 0.01, `scale_position` exclude) on the selected heads |
+| JuICE | `juice.py` | scales the o_proj contribution of the selected heads by 1 - s (suppression heads) and 1 + e (enhancement heads) with a capture pass and an inject pass per token; `profile` scales one head at a time by 1 + alpha over the alpha grid on the four profiling rows and records the change of the target token's probability (prefill only), `heads` ranks the profiled heads by their gain sum over the positive and the negative alphas (up to ten each), `fit` runs the 36 (s, e) pairs on the held-out development rows (`--config-index` for one), `select` picks the pair, `test` runs it |
+| AutoPASTA | `autopasta.py` | `extract` asks the model for the key sentence of the request's added paragraphs with the published extraction prompt, `map` maps it with all-MiniLM-L6-v2 to the closest sentence and its token span, the search stages (`coarse`, `rank`, `fine`, `candidates`, `fit`, `select`) pick the heads on the development split with a prefill-only read-out (every softmax layer, the six best layers head by head, the 28 candidates), `test` generates under pastalib's attention edit (alpha 0.01, `scale_position` exclude) on the selected heads |
 
 The search stages of the three fitted baselines need an Original run of the development split (`--gates`), whose
 correctly answered neutral rows define the fitting gate; the objective is the share of fitting rows whose reply names the
-row's target answer (`common.hit`). `baselines/artifacts/qwen35_9b/` holds the frozen outcome of the paper's fits for
-Qwen3.5-9B: the CAA vectors and selection, the JuICE head lists and selected pairs, the AutoPASTA selections with their
-layer ranking and candidate configurations, the mapped spans of every test and development row (`spans_test.jsonl`,
-`spans_dev.jsonl`), so the test stages reproduce the paper's inputs without rerunning the extraction, and the Original run
-of the development split that gated the fits (`dev_original.jsonl`). The per-configuration development outputs the
-selections were read from are not included; `fit` regenerates them.
+row's target answer (`common.hit`).
+
+### Fitting the baselines (`fit.py`)
+
+```
+python fit.py --model Qwen/Qwen3.5-9B                           # all three, variant fit-mix, artifacts in out/qwen35_9b/artifacts/
+python fit.py --model Qwen/Qwen3.5-9B --methods caa,juice       # a subset
+python fit.py --model Qwen/Qwen3.8-27B --device-map auto        # several GPUs
+```
+
+`fit.py` runs, in order and resumably: the Original run of the development split (`artifacts/dev_original.jsonl`, the
+gate); CAA (`caa/vectors.pt` from the official 1,000 pairs, downloaded on first use, the scan over every layer and the
+multipliers +-{0.5, 1, 1.5, 2}, `caa/selection.jsonl`); JuICE (`juice/<variant>/profile_rows.txt`: two gated rows per task
+family drawn with seed 42 with distinct conditions and questions, the per-head profile over every softmax layer and the
+alpha grid {1, 3, 5, 10, 30, -1, -2, -5}, `heads_v2.jsonl`, the 36 (suppress, enhance) pairs on the held-out rows in
+`fit_v2/`, `selection_v2.jsonl`); AutoPASTA (`autopasta/spans_dev.jsonl` and `spans_test.jsonl` from `extract` + `map`,
+the coarse search over every softmax layer, the fine search over the six best layers, the 28 candidates, their fit and
+`autopasta/<variant>/selection.jsonl`). `--variant` picks the fitting cells (fit-mix: all; fit-syco: wrong_claim;
+fit-stub: context_conflict). `--rows` restricts the development split to whole questions (neutral rows included) and
+`--caa-layers`, `--juice-layers`, `--juice-configs`, `--pasta-configs` narrow the scans; these are for smoke tests, the
+paper setting is the default. Every runner can also be called stage by stage (`--stage ...`, see each file's docstring),
+with `--shard i/n` to split a stage over processes. Two downloads happen on first use: the official CAA pairs (GitHub) and the
+`sentence-transformers/all-MiniLM-L6-v2` encoder of the AutoPASTA mapping (Hugging Face); an offline machine needs the
+pairs file passed with `--pairs` to `caa.py` and the encoder in its Hugging Face cache.
 
 ### Output records
 

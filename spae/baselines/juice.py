@@ -52,10 +52,11 @@ def main():
     p.add_argument('--gates', nargs='+', help='select: Original run of the development split')
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--artifacts', type=Path, required=True, help='directory with heads_v2.jsonl, selection_v2.jsonl, profile/, fit_v2/')
-    p.add_argument('--config-index', type=int)
+    p.add_argument('--config-index', type=int, help='fit: one of the 36 (suppress, enhance) pairs, written to --out (default: every pair, written to --out/config_XX.jsonl)')
+    p.add_argument('--configs', help='fit: comma list of pair indices instead of all 36')
     p.add_argument('--profile-rows', type=Path, help='profile / heads: the four profiling row ids, one per line (default: those stored in heads_v2.jsonl)')
-    p.add_argument('--layer-start', type=int, help='profile: first layer')
-    p.add_argument('--layer-end', type=int, help='profile: one past the last layer')
+    p.add_argument('--layer-start', type=int, default=0, help='profile: first layer (default 0)')
+    p.add_argument('--layer-end', type=int, help='profile: one past the last layer (default: the layer count)')
     p.add_argument('--alphas', default='1,3,5,10,30,-1,-2,-5', help='profile: the alpha grid')
     p.add_argument('--shard', default='0/1')
     p.add_argument('--batch', type=int, default=1)
@@ -65,15 +66,17 @@ def main():
     a.out.parent.mkdir(parents=True, exist_ok=True)
     heads_path = a.artifacts / 'heads_v2.jsonl'
     if a.stage != 'test':
-        dev = load([a.dev])
+        dev = {r['row_id']: r for r in keep_rows(list(load([a.dev]).values()), a.rows)}
         profile, held = partition(dev, a.variant, heads_path, a.profile_rows)
     if a.stage == 'profile':
         from transformers import AutoConfig
         cfg = text_config(AutoConfig.from_pretrained(a.model))
         full, nh = full_attention_layers(cfg), cfg.num_attention_heads
         alphas = [float(x) if '.' in x else int(x) for x in a.alphas.split(',')]
-        assert a.layer_start is not None and a.layer_end is not None and 0 <= a.layer_start < a.layer_end <= cfg.num_hidden_layers
-        e = JuiceEngine(a.model, a.cap_gib, a.no_think)
+        if a.layer_end is None:
+            a.layer_end = cfg.num_hidden_layers
+        assert 0 <= a.layer_start < a.layer_end <= cfg.num_hidden_layers
+        e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map)
         seqs, targets, target_ids = [], [], []
         for r in profile:
             gold = r['answers']['gold']
@@ -111,15 +114,19 @@ def main():
         from transformers import AutoConfig
         cfg = text_config(AutoConfig.from_pretrained(a.model))
         full = full_attention_layers(cfg)
-        rows = {}
+        rows, covered = {}, set()
         for path in sorted((a.artifacts / 'profile').glob('layers_*.jsonl')):
             manifest = json.loads(path.with_suffix('.config.json').read_text())
             assert manifest['profile_row_ids'] == [r['row_id'] for r in profile]
+            covered |= set(range(int(manifest['args']['layer_start']), int(manifest['args']['layer_end'])))
             for r in map(json.loads, path.read_text().splitlines()):
                 key = (r['layer'], r['head'])
                 assert key not in rows
                 rows[key] = r
-        assert set(rows) == {(l, h) for l in full for h in range(cfg.num_attention_heads)}, 'Incomplete profile'
+        expected = [l for l in full if l in covered]
+        assert set(rows) == {(l, h) for l in expected for h in range(cfg.num_attention_heads)}, 'Incomplete profile'
+        if expected != full:
+            print(f'warning: profile covers {len(expected)} of {len(full)} softmax layers', flush=True)
         chosen = {}
         for sign in ['positive', 'negative']:
             pool = [r for r in rows.values() if r[sign + '_gain_sum'] > 0]
@@ -158,36 +165,42 @@ def main():
         print('COMPLETE', flush=True)
         return
     if a.stage == 'fit':
-        assert a.config_index is not None and 0 <= a.config_index < 36
-        rows = held
-        suppress, enhance = divmod(a.config_index, 6)
-        datapath = a.dev
+        indices = [a.config_index] if a.config_index is not None else [int(x) for x in a.configs.split(',')] if a.configs else list(range(36))
+        assert all(0 <= i < 36 for i in indices)
+        jobs = [(a.out if a.config_index is not None else a.out / f'config_{i:02d}.jsonl', *divmod(i, 6), held, a.dev) for i in indices]
     else:
         selection = json.loads((a.artifacts / 'selection_v2.jsonl').read_text())
-        suppress, enhance = selection['suppress'], selection['enhance']
-        datapath = a.data
-        rows = keep_rows([r for r in load([datapath]).values() if r['direction'] != 'control'], a.rows)
+        rows = keep_rows([r for r in load([a.data]).values() if r['direction'] != 'control'], a.rows)
         i, n = map(int, a.shard.split('/'))
         assert 0 <= i < n
         rows = [r for j, r in enumerate(rows) if j % n == i]
+        jobs = [(a.out, selection['suppress'], selection['enhance'], rows, a.data)]
+    e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+    e.configure_sampling(a)
+    e.batch = a.batch
+    for out, suppress, enhance, rows, datapath in jobs:
+        generate(e, a, out, suppress, enhance, rows, datapath, heads, heads_path, label)
+    print('COMPLETE', flush=True)
+
+
+def generate(e, a, out, suppress, enhance, rows, datapath, heads, heads_path, label):
+    """Run `rows` under one (suppress, enhance) pair, appending to `out` (resumable; the probe only on the test split)."""
     specs = [(x['layer'], x['head'], enhance) for x in heads['positive_heads']] + [(x['layer'], x['head'], -suppress) for x in heads['negative_heads']]
-    signature = {'args': {k: str(v) for k, v in vars(a).items() if k != 'batch'},
+    signature = {'args': {k: str(v) for k, v in vars(a).items() if k not in ('batch', 'config_index', 'configs')},
                  'data_sha256': hashlib.sha256(datapath.read_bytes()).hexdigest(),
                  'heads_sha256': hashlib.sha256(heads_path.read_bytes()).hexdigest(),
                  'core_sha256': hashlib.sha256((HERE / 'juice_core.py').read_bytes()).hexdigest(),
                  'code_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                  'suppress': suppress, 'enhance': enhance}
-    cfg = a.out.with_suffix('.config.json')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cfg = out.with_suffix('.config.json')
     if cfg.exists():
         assert json.loads(cfg.read_text()) == signature, 'Incompatible resume'
     cfg.write_text(json.dumps(signature, indent=2) + '\n')
-    done = load([a.out]) if a.out.exists() else {}
-    e = JuiceEngine(a.model, a.cap_gib, a.no_think)
-    e.configure_sampling(a)
-    e.batch = a.batch
+    done = load([out]) if out.exists() else {}
     prepared = [(r, e.encode(r['prompt'])) for r in rows if r['row_id'] not in done]
     prepared.sort(key=lambda x: (x[0]['instruction_style'], len(x[1]), x[0]['row_id']))
-    with a.out.open('a', buffering=1) as fh:
+    with out.open('a', buffering=1) as fh:
         for style in ['short_phrase', 'cot_letter']:
             group = [r for r in prepared if r[0]['instruction_style'] == style]
             for offset in range(0, len(group), a.batch):
@@ -196,15 +209,14 @@ def main():
                 tokens = e.juice([x[1] for x in chunk], 400 if style == 'cot_letter' else 32, specs)
                 for (r, ids), gen in zip(chunk, tokens):
                     extra = {'model': label, 'method': 'juice-' + a.variant, 'suppress': suppress, 'enhance': enhance}
-                    out = finish_row(e, r, gen, extra, lambda letters, ids=ids, gen=gen: e.juice_probe(ids, gen, letters, specs) if a.stage == 'test' else {})
+                    out_row = finish_row(e, r, gen, extra, lambda letters, ids=ids, gen=gen: e.juice_probe(ids, gen, letters, specs) if a.stage == 'test' else {})
                     if a.stage != 'test':
-                        out['answer'] = out.get('stated_answer', out['answer'])
-                    fh.write(json.dumps(out, ensure_ascii=False) + '\n')
-                    done[r['row_id']] = out
+                        out_row['answer'] = out_row.get('stated_answer', out_row['answer'])
+                    fh.write(json.dumps(out_row, ensure_ascii=False) + '\n')
+                    done[r['row_id']] = out_row
                 fh.flush()
                 os.fsync(fh.fileno())
-                print(json.dumps({'stage': a.stage, 'rows': len(done), 'expected': len(rows), 'variant': a.variant}), flush=True)
-    print('COMPLETE', flush=True)
+                print(json.dumps({'stage': a.stage, 'file': str(out), 'rows': len(done), 'expected': len(rows), 'variant': a.variant}), flush=True)
 
 
 if __name__ == '__main__':

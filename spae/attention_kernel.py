@@ -76,15 +76,20 @@ class ShareBias:
                 if S > 1:
                     beta = beta.clone()
                     if want_m:
-                        beta = torch.where(self.m_mask[:B, :S].unsqueeze(-1), beta * self.lin_alpha, beta)
+                        beta = torch.where(self._dev(self.m_mask, beta.device)[:B, :S].unsqueeze(-1), beta * self.lin_alpha, beta)
                     if want_e:
-                        beta = torch.where(self.e_mask[:B, :S].unsqueeze(-1), beta + (1.0 - beta) * self.lin_rho, beta)
+                        beta = torch.where(self._dev(self.e_mask, beta.device)[:B, :S].unsqueeze(-1), beta + (1.0 - beta) * self.lin_rho, beta)
                     if "beta" in kw:
                         kw["beta"] = beta
                     else:
                         args = args[:4] + (beta,) + args[5:]
             return fn(*args, **kw)
         return call
+
+    @staticmethod
+    def _dev(t, device):
+        """`t` on `device` (a model spread over several GPUs runs each layer on its own device); None passes through."""
+        return t if t is None or t.device == device else t.to(device)
 
     def reset(self, rows: int = 1, device=None) -> None:
         """Drop every span and restriction, so the next forward pass is unmodified.
@@ -204,89 +209,90 @@ class ShareBias:
         keys = self.repeat_kv(key, module.num_key_value_groups)
         values = self.repeat_kv(value, module.num_key_value_groups)
         weights = torch.matmul(query, keys.transpose(2, 3)) * scaling
+        D = weights.device
         if attention_mask is not None:
             weights = weights + attention_mask[:, :, :, : keys.shape[-2]]
         if self.mode != "off" and self.has_m:
             # Suppression is applied first, as a plain key bias on its own set, so that the evidence controller below
             # measures and raises the evidence share on the distribution that no longer reads the suppressed span.
             B, H, Q, K = weights.shape
-            m = self.m_mask[:B, :K].view(B, 1, 1, K)
+            m = self._dev(self.m_mask, D)[:B, :K].view(B, 1, 1, K)
             base_m = torch.softmax(weights.float(), dim=-1)
             s_m = (base_m * m).sum(-1)                                      # [B, H, Q]
             log_m = torch.full_like(s_m, math.log(self.m_alpha))
-            if self.m_allow is not None:
+            if self._dev(self.m_allow, D) is not None:
                 q_abs = torch.arange(K - Q, K, device=weights.device)
-                gate = self.m_allow[:B][:, q_abs].view(B, 1, Q)
+                gate = self._dev(self.m_allow, D)[:B][:, q_abs].view(B, 1, Q)
                 log_m = torch.where(gate, log_m, torch.zeros_like(log_m))
-            if self.m_head_mask is not None:                                # restrict the layers and heads
-                hm = self.m_head_mask[:B, module.layer_idx].view(B, H, 1)
+            if self._dev(self.m_head_mask, D) is not None:                                # restrict the layers and heads
+                hm = self._dev(self.m_head_mask, D)[:B, module.layer_idx].view(B, H, 1)
                 log_m = torch.where(hm, log_m, torch.zeros_like(log_m))
-            live_m = (self.m_mask[:B].any(-1)).to(base_m.dtype)
-            if self.active is not None:
-                live_m = live_m * self.active[:B].to(base_m.dtype)
-            self.stats["m_n"] += (live_m * float(H * Q)).double()
-            self.stats["m_pre"] += (s_m * live_m.view(B, 1, 1)).sum((1, 2)).double()
+            live_m = (self._dev(self.m_mask, D)[:B].any(-1)).to(base_m.dtype)
+            if self._dev(self.active, D) is not None:
+                live_m = live_m * self._dev(self.active, D)[:B].to(base_m.dtype)
+            self.stats["m_n"] += (live_m * float(H * Q)).double().to(self.device)
+            self.stats["m_pre"] += (s_m * live_m.view(B, 1, 1)).sum((1, 2)).double().to(self.device)
             weights = weights + (log_m.unsqueeze(-1) * m.to(log_m.dtype)).to(weights.dtype)
         if self.mode != "off" and self.has_e:
             B, H, Q, K = weights.shape
-            e = self.e_mask[:B, :K].view(B, 1, 1, K)
+            e = self._dev(self.e_mask, D)[:B, :K].view(B, 1, 1, K)
             base = torch.softmax(weights.float(), dim=-1)                   # [B, H, Q, K]
             s_e = (base * e).sum(-1)                                        # [B, H, Q]
             log_d = None
             if self.mode == "fixed":
                 log_e = torch.full_like(s_e, math.log(self.alpha))
             elif self.mode == "dynamic":
-                if self.ref_mask is None:
+                if self._dev(self.ref_mask, D) is None:
                     beta_e = self._beta_dynamic(s_e)
                 else:                                               # matched control: same gain, other content
-                    s_ref = (base * self.ref_mask[:B, :K].view(B, 1, 1, K)).sum(-1)
+                    s_ref = (base * self._dev(self.ref_mask, D)[:B, :K].view(B, 1, 1, K)).sum(-1)
                     gain = (torch.minimum(s_ref + self.cap, torch.full_like(s_ref, self.target)) - s_ref).clamp(min=0)
                     beta_e = self._beta_for_share(s_e, gain)
                 log_e = torch.log(beta_e)
             elif not self.has_d:
                 log_e = torch.zeros_like(s_e)
             else:
-                d = self.d_mask[:B, :K].view(B, 1, 1, K)
+                d = self._dev(self.d_mask, D)[:B, :K].view(B, 1, 1, K)
                 beta_e, beta_d = self._beta_transfer(s_e, (base * d).sum(-1))
                 log_e = torch.log(beta_e)
                 log_d = torch.full_like(s_e, math.log(beta_d))
             if self.min_share > 0:                                          # only heads that already read the span
                 log_e = torch.where(s_e >= self.min_share, log_e, torch.zeros_like(log_e))
-            if self.q_allow is not None:                                    # restrict the receiver rows
+            if self._dev(self.q_allow, D) is not None:                                    # restrict the receiver rows
                 q_abs = torch.arange(K - Q, K, device=base.device)
-                gate = self.q_allow[:B][:, q_abs].view(B, 1, Q)
+                gate = self._dev(self.q_allow, D)[:B][:, q_abs].view(B, 1, Q)
                 log_e = torch.where(gate, log_e, torch.zeros_like(log_e))
                 log_d = None if log_d is None else torch.where(gate, log_d, torch.zeros_like(log_d))
-            if self.head_mask is not None:                                  # restrict the heads
-                hm = self.head_mask[:B, module.layer_idx].view(B, H, 1)
+            if self._dev(self.head_mask, D) is not None:                                  # restrict the heads
+                hm = self._dev(self.head_mask, D)[:B, module.layer_idx].view(B, H, 1)
                 log_e = torch.where(hm, log_e, torch.zeros_like(log_e))
                 log_d = None if log_d is None else torch.where(hm, log_d, torch.zeros_like(log_d))
             bias = log_e.unsqueeze(-1) * e.to(log_e.dtype)                  # E wins wherever E and D overlap
             if log_d is not None:
-                bias = bias + log_d.unsqueeze(-1) * (self.d_mask[:B, :K].view(B, 1, 1, K) & ~e).to(log_e.dtype)
+                bias = bias + log_d.unsqueeze(-1) * (self._dev(self.d_mask, D)[:B, :K].view(B, 1, 1, K) & ~e).to(log_e.dtype)
             beta_applied = torch.exp(log_e)
             z = (1 - s_e + beta_applied * s_e).clamp_min(1e-6)
             new_e = (beta_applied * s_e) / z
             # accumulate per row on the device; one read-back per batch instead of a sync per layer and step
-            live_row = self.row_has_e[:B].to(base.dtype)
-            if self.active is not None:
-                live_row = live_row * self.active[:B].to(base.dtype)
+            live_row = self._dev(self.row_has_e, D)[:B].to(base.dtype)
+            if self._dev(self.active, D) is not None:
+                live_row = live_row * self._dev(self.active, D)[:B].to(base.dtype)
             live = live_row.view(B, 1, 1)
-            self.delta_sum += ((new_e - s_e) * live).sum((1, 2)).double()
-            self.delta_n += (live_row * float(H * Q)).double()
+            self.delta_sum += ((new_e - s_e) * live).sum((1, 2)).double().to(self.device)
+            self.delta_n += (live_row * float(H * Q)).double().to(self.device)
             applied = (beta_applied > 1.0 + 1e-6).to(base.dtype) * live
             st = self.stats
-            st["n"] += applied.sum((1, 2)).double()
-            st["e_pre"] += (s_e * applied).sum((1, 2)).double()
-            st["e_post"] += (new_e * applied).sum((1, 2)).double()
-            st["reached"] += ((new_e >= self.target - 0.01).to(base.dtype) * applied).sum((1, 2)).double()
-            if self.probe_mask is not None:
-                pr = self.probe_mask[:B, :K].view(B, 1, 1, K)
+            st["n"] += applied.sum((1, 2)).double().to(self.device)
+            st["e_pre"] += (s_e * applied).sum((1, 2)).double().to(self.device)
+            st["e_post"] += (new_e * applied).sum((1, 2)).double().to(self.device)
+            st["reached"] += ((new_e >= self.target - 0.01).to(base.dtype) * applied).sum((1, 2)).double().to(self.device)
+            if self._dev(self.probe_mask, D) is not None:
+                pr = self._dev(self.probe_mask, D)[:B, :K].view(B, 1, 1, K)
                 s_p = (base * pr).sum(-1)
                 s_in = (base * (pr & e)).sum(-1)
                 new_p = (beta_applied * s_in + (s_p - s_in)) / z
-                st["p_pre"] += (s_p * applied).sum((1, 2)).double()
-                st["p_post"] += (new_p * applied).sum((1, 2)).double()
+                st["p_pre"] += (s_p * applied).sum((1, 2)).double().to(self.device)
+                st["p_post"] += (new_p * applied).sum((1, 2)).double().to(self.device)
             weights = weights + bias.to(weights.dtype)
         weights = torch.nn.functional.softmax(weights, dim=-1, dtype=torch.float32)
         if self.collect:

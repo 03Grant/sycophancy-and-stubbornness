@@ -701,6 +701,7 @@ def main() -> None:
     p.add_argument("--directions", help="comma list of row directions to keep")
     p.add_argument("--shard", help="i/n")
     p.add_argument("--limit", type=int)
+    p.add_argument("--device-map", help="spread the model over several GPUs with accelerate, e.g. auto (default: one device)")
     p.add_argument("--rows", type=Path, help="keep only the row ids listed in this file (one per line)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--last-only", action="store_true")
@@ -752,11 +753,12 @@ def main() -> None:
         tok.pad_token = tok.eos_token
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    extra = {"device_map": args.device_map} if args.device_map else {}
     try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, attn_implementation="eager")
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, attn_implementation="eager", **extra)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, attn_implementation="eager")
-    model = model.to(device).eval()
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, attn_implementation="eager", **extra)
+    model = (model if args.device_map else model.to(device)).eval()
     if args.sample or args.sample_answer:
         gc = model.generation_config
         args.temperature = args.temperature if args.temperature is not None else (gc.temperature if gc.temperature not in (None, 1.0) or gc.do_sample else 0.7)
