@@ -76,7 +76,7 @@ def main():
         if a.layer_end is None:
             a.layer_end = cfg.num_hidden_layers
         assert 0 <= a.layer_start < a.layer_end <= cfg.num_hidden_layers
-        e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+        e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
         seqs, targets, target_ids = [], [], []
         for r in profile:
             gold = r['answers']['gold']
@@ -175,7 +175,7 @@ def main():
         assert 0 <= i < n
         rows = [r for j, r in enumerate(rows) if j % n == i]
         jobs = [(a.out, selection['suppress'], selection['enhance'], rows, a.data)]
-    e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+    e = JuiceEngine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
     e.configure_sampling(a)
     e.batch = a.batch
     for out, suppress, enhance, rows, datapath in jobs:

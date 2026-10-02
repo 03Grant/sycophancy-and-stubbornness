@@ -78,6 +78,7 @@ def add_model_args(p):
     p.add_argument('--cap-gib', type=float, help='optional per-process GPU memory cap in GiB')
     p.add_argument('--no-think', action='store_true', help='chat template with enable_thinking=False (thinking-mode models)')
     p.add_argument('--device-map', help='spread the model over several GPUs with accelerate, e.g. auto (default: one device)')
+    p.add_argument('--experts-implementation', choices=['grouped_mm', 'batched_mm', 'eager'], help='mixture-of-experts backbones (gemma-4-26B-A4B-it): the expert kernel; the default grouped matmul needs torch >= 2.10 on GPUs other than Hopper, batched_mm runs anywhere')
 
 
 def keep_rows(rows, path):

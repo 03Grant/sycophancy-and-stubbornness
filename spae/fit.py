@@ -79,6 +79,7 @@ def main():
     p.add_argument('--label', help='backbone label (default: from the settings table, else the model name)')
     p.add_argument('--variant', default='fit-mix', choices=list(VARIANT_CELL))
     p.add_argument('--no-think', action='store_true', help='force the thinking switch off (default: from the settings table)')
+    p.add_argument('--experts-implementation', choices=['grouped_mm', 'batched_mm', 'eager'], help='mixture-of-experts backbones (gemma-4-26B-A4B-it): the expert kernel; the default grouped matmul needs torch >= 2.10 on GPUs other than Hopper, batched_mm runs anywhere')
     p.add_argument('--device-map', help='spread the model over several GPUs with accelerate, e.g. auto')
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--rows', help='row-id file: fit on these development rows only (whole questions, neutral rows included); a smoke test')
@@ -108,6 +109,8 @@ def main():
         sys.exit(f'unknown methods: {unknown}; choose from {FITTED} or all')
     think = ['--no-think'] if a.no_think or cfg.get('think', True) else []
     dm = ['--device-map', a.device_map] if a.device_map else []
+    if a.experts_implementation:
+        dm += ['--experts-implementation', a.experts_implementation]
     rows_arg = ['--rows', str(Path(a.rows).resolve())] if a.rows else []
     py, DEV, TEST = a.python, str(Path(a.dev).resolve()), str(Path(a.test).resolve())
     common = ['--model', a.model, '--model-label', label, *think, *dm, '--batch', str(a.batch)]

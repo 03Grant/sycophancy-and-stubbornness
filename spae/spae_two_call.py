@@ -702,6 +702,7 @@ def main() -> None:
     p.add_argument("--shard", help="i/n")
     p.add_argument("--limit", type=int)
     p.add_argument("--device-map", help="spread the model over several GPUs with accelerate, e.g. auto (default: one device)")
+    p.add_argument("--experts-implementation", choices=["grouped_mm", "batched_mm", "eager"], help="mixture-of-experts backbones (gemma-4-26B-A4B-it): the expert kernel; the default grouped matmul needs torch >= 2.10 on GPUs other than Hopper, batched_mm runs anywhere")
     p.add_argument("--rows", type=Path, help="keep only the row ids listed in this file (one per line)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--last-only", action="store_true")
@@ -754,6 +755,8 @@ def main() -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     extra = {"device_map": args.device_map} if args.device_map else {}
+    if args.experts_implementation:
+        extra["experts_implementation"] = args.experts_implementation
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, attn_implementation="eager", **extra)
     except TypeError:

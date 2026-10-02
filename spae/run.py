@@ -64,6 +64,7 @@ def main():
     p.add_argument('--variant', default='fit-mix', choices=['fit-mix', 'fit-syco', 'fit-stub'], help='which fit of CAA / JuICE / AutoPASTA')
     p.add_argument('--spae-flags', help='override the SPAE parameters (default: the settings table entry of the backbone)')
     p.add_argument('--no-think', action='store_true', help='force the thinking switch off (default: from the settings table)')
+    p.add_argument('--experts-implementation', choices=['grouped_mm', 'batched_mm', 'eager'], help='mixture-of-experts backbones (gemma-4-26B-A4B-it): the expert kernel; the default grouped matmul needs torch >= 2.10 on GPUs other than Hopper, batched_mm runs anywhere')
     p.add_argument('--device-map', help='spread the model over several GPUs with accelerate, e.g. auto (default: one device)')
     p.add_argument('--batch', type=int, default=1, help='batch size of the baseline runners')
     p.add_argument('--limit', type=int, help='smoke test: rows per stage')
@@ -94,6 +95,8 @@ def main():
         sys.exit('no settings entry for this backbone: pass --spae-flags')
     think = ['--no-think'] if a.no_think or cfg.get('think', True) else []
     dm = ['--device-map', a.device_map] if a.device_map else []
+    if a.experts_implementation:
+        dm += ['--experts-implementation', a.experts_implementation]
     needed = {'caa': [arts / 'caa' / 'vectors.pt', arts / 'caa' / 'selection.jsonl'],
               'juice': [arts / 'juice' / a.variant / 'heads_v2.jsonl', arts / 'juice' / a.variant / 'selection_v2.jsonl'],
               'autopasta': [arts / 'autopasta' / a.variant / 'selection.jsonl', arts / 'autopasta' / 'spans_test.jsonl']}

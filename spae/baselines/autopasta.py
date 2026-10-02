@@ -91,7 +91,7 @@ def main():
         rows = rows[:a.limit]
     if a.stage == 'map':
         from autopasta_core import PastaEngine
-        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
         extracted = load([a.extracted])
         done = load([a.out]) if a.out.exists() else {}
         with a.out.open('a', buffering=1) as fh:
@@ -105,7 +105,7 @@ def main():
         return
     if a.stage == 'extract':
         from autopasta_core import PastaEngine
-        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+        e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
         e.batch = a.batch
         done = load([a.out]) if a.out.exists() else {}
         todo = [r for r in rows if r['row_id'] not in done]
@@ -168,7 +168,7 @@ def main():
         assert json.loads(cfg.read_text()) == sig, 'Incompatible resume'
     cfg.write_text(json.dumps(sig, indent=2) + '\n')
     from autopasta_core import PastaEngine
-    e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map)
+    e = PastaEngine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
     e.configure_sampling(a)
     e.batch = a.batch
     prepared = [(r, e.encode(r['prompt']), maps[r['row_id']]['highlight_tokens']) for r in rows]

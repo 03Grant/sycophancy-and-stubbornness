@@ -172,7 +172,7 @@ def main():
     rows = [r for r in data.values() if r['direction'] != 'control']
     if a.stage == 'fit' and any(r['split'] != 'dev' for r in data.values()):
         raise ValueError('Fit requires the development split only')
-    engine = Engine(a.model, a.cap_gib, a.no_think, a.device_map)
+    engine = Engine(a.model, a.cap_gib, a.no_think, a.device_map, a.experts_implementation)
     engine.configure_sampling(a)
     engine.batch = a.batch
     vecs = vectors(engine, a.pairs, a.vectors, a.batch)

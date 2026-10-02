@@ -31,7 +31,7 @@ CHAT_KWARGS = {}   # set to {'enable_thinking': False} by --no-think
 class Engine:
     """One loaded model with left-padded batching, greedy or per-row-seeded sampled decoding, and the letter probe."""
 
-    def __init__(self, model_path, cap_gib=None, no_think=False, device_map=None):
+    def __init__(self, model_path, cap_gib=None, no_think=False, device_map=None, experts=None):
         torch.set_num_threads(4)
         torch.manual_seed(0)
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -46,6 +46,8 @@ class Engine:
         self.tok.padding_side = 'left'
         dtype = torch.bfloat16 if self.device == 'cuda' else torch.float32
         extra = {'device_map': device_map} if device_map else {}
+        if experts:
+            extra['experts_implementation'] = experts
         try:
             self.model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation='eager', **extra)
         except TypeError:
@@ -278,7 +280,7 @@ def main():
     if not rows:
         print('COMPLETE already done', flush=True)
         return
-    e = Engine(args.model, args.cap_gib, args.no_think, args.device_map)
+    e = Engine(args.model, args.cap_gib, args.no_think, args.device_map, args.experts_implementation)
     e.configure_sampling(args)
     e.batch = args.batch   # under sampling a chunk shares one stream seeded from its first row
     rewrite_map = {}

@@ -40,7 +40,10 @@ The method code was frozen as run; the modules below are the parts of the resear
 
 Python 3.10, PyTorch 2.11 (CUDA 13), transformers 5.12, numpy 2.2, accelerate; Qwen3.5-9B in bf16 needs about 20 GB of GPU
 memory; the paper's runs used NVIDIA H200 GPUs. A backbone that does not fit on one GPU (gemma-4-26B-A4B-it, Qwen3.8-27B on
-32 GB cards) is spread over every visible GPU with `--device-map auto` (accepted by `run.py`, `fit.py` and every runner). The kernel replaces `eager_attention_forward` of the model's attention module, so the runner loads the
+32 GB cards) is spread over every visible GPU with `--device-map auto` (accepted by `run.py`, `fit.py` and every runner). The
+mixture-of-experts backbone (gemma-4-26B-A4B-it) runs its experts through PyTorch's grouped matmul, which on GPUs other
+than Hopper needs torch 2.10 or newer; on an older torch pass `--experts-implementation batched_mm` (same values, a
+plain batched kernel). The kernel replaces `eager_attention_forward` of the model's attention module, so the runner loads the
 model with `attn_implementation="eager"`; on Qwen3.5 the transformers implementation of the Gated DeltaNet layers
 is wrapped (the optional fused kernels are not required). `--no-think` switches the Qwen3.5 thinking mode off in the
 chat template; every backbone is run as an instruct model with the whole prompt as one user turn.
