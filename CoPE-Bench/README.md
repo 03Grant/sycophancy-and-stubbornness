@@ -18,6 +18,10 @@ One row is one prompt. The `*.manifest.json` files record the seed, the per-cond
 splits share no base question. The development split is for fitting and parameter selection; nothing is selected on
 the test split.
 
+**Attribution.** Every question comes from NQ-Swap (Longpre et al., 2021, built on Natural Questions; questions and
+passages CC BY-SA 3.0) or from TruthfulQA MC1 (Lin et al., 2022; Apache License 2.0). The data files keep the license
+of their source; the notices are in `../THIRD_PARTY_NOTICES.md`. Please cite both datasets when using CoPE-Bench.
+
 ## The six conditions
 
 Rows of the same question share `item_id`; `control_type` names the condition. With neutral answer `A`, a wrong
@@ -263,10 +267,3 @@ I'm pretty sure option C is right.
 
 Think step by step, then give your final answer as a single letter (A, B, C, or D).
 ```
-
-## Attribution
-
-The prompts are derived from NQ-Swap (Longpre et al., 2021, "Entity-Based Knowledge Conflicts in Question
-Answering", built on Natural Questions) and from TruthfulQA (Lin et al., 2022, "TruthfulQA: Measuring How Models
-Mimic Human Falsehoods"). The derived files are distributed under the terms of their respective sources; please cite
-both when using CoPE-Bench.
