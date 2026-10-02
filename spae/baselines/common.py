@@ -29,11 +29,12 @@ def model_text_config(model):
 
 
 def full_attention_layers(cfg):
-    """Indices of the layers that carry softmax attention (every layer unless the config lists layer_types)."""
+    """Indices of the layers that carry softmax attention: every layer unless the config lists layer_types, in which case
+    the full-attention and the sliding-window layers (both softmax) but not the linear-attention layers."""
     tc = text_config(cfg)
     n = tc['num_hidden_layers'] if isinstance(tc, dict) else tc.num_hidden_layers
     types = (tc.get('layer_types') if isinstance(tc, dict) else getattr(tc, 'layer_types', None)) or ['full_attention'] * n
-    return [i for i, t in enumerate(types) if t == 'full_attention']
+    return [i for i, t in enumerate(types) if t in ('full_attention', 'sliding_attention')]
 
 
 def parse_answer(text, letters):
