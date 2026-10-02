@@ -1,8 +1,12 @@
-"""JuICE on CoPE-Bench: frozen head selection (`heads_v2.jsonl`), the 6 x 6 suppression / enhancement grid fitted on the
-held-out development rows (`fit`, `select`) and the test run under the selected pair (`test`).
+"""JuICE on CoPE-Bench: per-head profiling on four development rows (`profile`), the frozen head selection from the
+profiles (`heads`), the 6 x 6 suppression / enhancement grid fitted on the held-out development rows (`fit`, `select`)
+and the test run under the selected pair (`test`).
 
 The development rows of a variant (fit-mix: all scored cells; fit-syco: wrong_claim; fit-stub: context_conflict) are
-split into the profiling rows, whose ids are stored with the head selection, and the held-out rows used for fitting."""
+split into the four profiling rows (`--profile-rows`, also stored with the head selection) and the held-out rows of
+the other questions. Profiling scales one head at a time by 1 + alpha over the alpha grid and records, per profiling
+row, the change of the probability of the row's target token (the first token of the target answer) at the next
+position of the prefilled request; a head's gain sum over the positive or the negative alphas ranks it."""
 import argparse
 import hashlib
 import json
@@ -25,9 +29,12 @@ def variant_rows(dev, variant):
     return [r for r in dev.values() if r['direction'] != 'control' and (cell is None or r['control_type'] == cell)]
 
 
-def partition(dev, variant, heads_path):
+def partition(dev, variant, heads_path, profile_rows=None):
     """The profiling rows (in the stored order) and the held-out rows: the variant's development cells minus every row of the profiled questions."""
-    ids = json.loads(Path(heads_path).read_text())['profile_row_ids']
+    if profile_rows:
+        ids = [x.strip() for x in Path(profile_rows).read_text().splitlines() if x.strip()]
+    else:
+        ids = json.loads(Path(heads_path).read_text())['profile_row_ids']
     profile = [dev[i] for i in ids]
     items = {r['item_id'] for r in profile}
     held = [r for r in variant_rows(dev, variant) if r['item_id'] not in items]
@@ -37,7 +44,7 @@ def partition(dev, variant, heads_path):
 def main():
     """Select heads from a profile, fit the strength grid, select the pair, or run the test rows."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--stage', choices=['heads', 'fit', 'select', 'test'], required=True)
+    p.add_argument('--stage', choices=['profile', 'heads', 'fit', 'select', 'test'], required=True)
     add_model_args(p)
     p.add_argument('--variant', choices=list(VARIANT_CELL), default='fit-mix')
     p.add_argument('--data', type=Path, required=True, help='test split')
@@ -46,6 +53,10 @@ def main():
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--artifacts', type=Path, required=True, help='directory with heads_v2.jsonl, selection_v2.jsonl, profile/, fit_v2/')
     p.add_argument('--config-index', type=int)
+    p.add_argument('--profile-rows', type=Path, help='profile / heads: the four profiling row ids, one per line (default: those stored in heads_v2.jsonl)')
+    p.add_argument('--layer-start', type=int, help='profile: first layer')
+    p.add_argument('--layer-end', type=int, help='profile: one past the last layer')
+    p.add_argument('--alphas', default='1,3,5,10,30,-1,-2,-5', help='profile: the alpha grid')
     p.add_argument('--shard', default='0/1')
     p.add_argument('--batch', type=int, default=1)
     add_sampling_args(p)
@@ -55,7 +66,47 @@ def main():
     heads_path = a.artifacts / 'heads_v2.jsonl'
     if a.stage != 'test':
         dev = load([a.dev])
-        profile, held = partition(dev, a.variant, heads_path)
+        profile, held = partition(dev, a.variant, heads_path, a.profile_rows)
+    if a.stage == 'profile':
+        from transformers import AutoConfig
+        cfg = text_config(AutoConfig.from_pretrained(a.model))
+        full, nh = full_attention_layers(cfg), cfg.num_attention_heads
+        alphas = [float(x) if '.' in x else int(x) for x in a.alphas.split(',')]
+        assert a.layer_start is not None and a.layer_end is not None and 0 <= a.layer_start < a.layer_end <= cfg.num_hidden_layers
+        e = JuiceEngine(a.model, a.cap_gib, a.no_think)
+        seqs, targets, target_ids = [], [], []
+        for r in profile:
+            gold = r['answers']['gold']
+            gold = gold[0] if isinstance(gold, list) else gold
+            seqs.append(e.encode(r['prompt']))
+            targets.append(gold)
+            target_ids.append(e.tok.convert_tokens_to_ids(e.tok.tokenize(gold)[0]))
+        manifest = {'args': {k: str(v) for k, v in vars(a).items() if k in ('model', 'model_label', 'cap_gib', 'variant', 'layer_start', 'layer_end', 'out')},
+                    'data_sha256': hashlib.sha256(a.dev.read_bytes()).hexdigest(), 'code_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    'profile_row_ids': [r['row_id'] for r in profile], 'profile_item_ids': [r['item_id'] for r in profile], 'validation_rows': len(held),
+                    'targets': targets, 'target_token_ids': target_ids, 'alphas': alphas, 'heads': nh, 'layers': cfg.num_hidden_layers}
+        a.out.with_suffix('.config.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        done = load([a.out]) if a.out.exists() else {}
+        clean = [e.juice_prefill(seq, tid, []) for seq, tid in zip(seqs, target_ids)]
+        with a.out.open('a', buffering=1) as fh:
+            for layer in range(a.layer_start, a.layer_end):
+                if layer not in full:
+                    continue
+                for head in range(nh):
+                    rid = f'layer{layer}:head{head}'
+                    if rid in done:
+                        continue
+                    gains = {str(alpha): [e.juice_prefill(seq, tid, [(layer, head, alpha)]) - c for seq, tid, c in zip(seqs, target_ids, clean)] for alpha in alphas}
+                    means = {k: sum(v) / len(v) for k, v in gains.items()}
+                    pos, neg = [str(x) for x in alphas if x > 0], [str(x) for x in alphas if x < 0]
+                    rec = {'row_id': rid, 'layer': layer, 'head': head, 'clean_probability': clean, 'gain_by_alpha': gains, 'mean_gain_by_alpha': means,
+                           'positive_eligible': all(means[k] > 0 for k in pos), 'negative_eligible': all(means[k] > 0 for k in neg),
+                           'positive_gain_sum': sum(means[k] for k in pos), 'negative_gain_sum': sum(means[k] for k in neg)}
+                    fh.write(json.dumps(rec) + '\n')
+                    fh.flush()
+                print(json.dumps({'stage': 'profile', 'layer': layer, 'heads': nh}), flush=True)
+        print('COMPLETE', flush=True)
+        return
     if a.stage == 'heads':
         from transformers import AutoConfig
         cfg = text_config(AutoConfig.from_pretrained(a.model))

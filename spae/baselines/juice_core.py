@@ -99,6 +99,19 @@ class JuiceEngine(Engine):
         return results
 
     @torch.inference_mode()
+    def juice_prefill(self, seq, target, specs):
+        """Probability of `target` at the next position of `seq` (prefill only), under the two-pass intervention when `specs` is non-empty."""
+        ids = torch.tensor([seq], device=self.device)
+        if not specs:
+            out = self.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False, logits_to_keep=1)
+        else:
+            hooks = HeadHooks(self.model, specs)
+            for mode in ('capture', 'inject'):
+                with hooks.install(mode):
+                    out = self.model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False, logits_to_keep=1)
+        return float(out.logits[0, -1].float().softmax(-1)[target])
+
+    @torch.inference_mode()
     def juice_probe(self, prompt, tokens, letters, specs):
         """Letter logits at the fixed suffix under the same two-pass intervention."""
         cut, marker, trimmed = find_commitment_cut(self.tok, tokens, phrase_fallback=True, letters=letters)

@@ -1,6 +1,6 @@
 """CAA: a per-layer mean-difference vector from the official 1,000 sycophancy pairs, added to the residual stream at one
-layer with one multiplier; the (layer, multiplier) pair is selected on the development split (`--stage fit`) and then
-held fixed (`--stage test`)."""
+layer with one multiplier; the (layer, multiplier) pair is selected on the development split (`--stage fit`, every
+layer by default as in the CAA protocol, `--layers` narrows the scan) and then held fixed (`--stage test`)."""
 import argparse
 import hashlib
 import json
@@ -75,6 +75,20 @@ def vectors(engine, pairs_path, out, batch):
     return result
 
 
+def scan_layers(spec, n_layers):
+    """The layer indices a fit scans: every layer for 'all', else an inclusive range 'a-b' or a comma-separated list."""
+    if spec == 'all':
+        return list(range(n_layers))
+    if '-' in spec:
+        a, b = map(int, spec.split('-'))
+        layers = list(range(a, b + 1))
+    else:
+        layers = [int(x) for x in spec.split(',') if x.strip()]
+    if not layers or any(not 0 <= l < n_layers for l in layers):
+        raise ValueError(f'Layers {spec} outside 0..{n_layers - 1}')
+    return layers
+
+
 @contextmanager
 def steer(engine, vector, layer, multiplier, prompt_width):
     """Add multiplier * vector to the residual stream of `layer` from the final prompt token onwards."""
@@ -139,6 +153,7 @@ def main():
     p.add_argument('--gates', nargs='+', help='fit: Original run of the development split (its neutral rows define the fitting gate)')
     p.add_argument('--selection', type=Path, help='test: the selection file written by --stage fit')
     p.add_argument('--variant', choices=['fit-mix', 'fit-syco', 'fit-stub'], default='fit-mix')
+    p.add_argument('--layers', default='all', help="fit: layers to scan: 'all' (default), a range 'a-b' (inclusive) or a comma list")
     p.add_argument('--shard', default='0/1')
     add_sampling_args(p)
     a = p.parse_args()
@@ -163,8 +178,7 @@ def main():
     if any(r['row_id'] not in original for r in controls):
         raise ValueError('Incomplete development gates')
     eligible = {r['item_id'] for r in controls if hit(r, original[r['row_id']], 'gold')}
-    center = len(vecs) // 2
-    layers = list(range(center - 2, center + 3))
+    layers = scan_layers(a.layers, len(vecs))
     multipliers = [-2, -1.5, -1, -.5, .5, 1, 1.5, 2]
     all_scores = []
     for layer in layers:
@@ -183,7 +197,7 @@ def main():
     for variant in ('fit-mix', 'fit-syco', 'fit-stub'):
         chosen = max(all_scores, key=lambda x: (x['scores'][variant], -abs(x['multiplier']), -x['layer'], -x['multiplier']))
         records.append({'row_id': variant, 'model': label, 'layer': chosen['layer'], 'multiplier': chosen['multiplier'],
-                        'dev_score': chosen['scores'][variant], 'gated_items': len(eligible), 'scan': all_scores,
+                        'dev_score': chosen['scores'][variant], 'gated_items': len(eligible), 'layers_scanned': layers, 'scan': all_scores,
                         'vector_scale': 'raw_mean_difference', 'tie_break': 'score, smaller_abs_multiplier, lower_layer, lower_multiplier'})
     tmp = a.out.with_suffix('.tmp')
     tmp.write_text(''.join(json.dumps(r) + '\n' for r in records))
