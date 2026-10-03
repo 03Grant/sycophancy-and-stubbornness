@@ -1,6 +1,6 @@
 # CoPE-Bench and SPAE
 
-Anonymous artifact accompanying the submission "Suppressing Pressure, Amplifying Evidence" (SPAE) on CoPE-Bench.
+Code and data for the paper "Suppressing Pressure, Amplifying Evidence: Self-Guided Attention Steering to Mitigate Sycophancy and Stubbornness".
 
 > **Data sources.** CoPE-Bench is derived from two public benchmarks: **NQ-Swap** (Longpre et al., 2021, built on
 > Natural Questions) and **TruthfulQA** MC1 (Lin et al., 2022). We redistribute modified questions, passages and options
